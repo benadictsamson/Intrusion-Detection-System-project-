@@ -1,2 +1,6 @@
-# Intrusion-Detection-System-project-
-Intrusion Detection System project description 
+node_modules/
+.env
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm

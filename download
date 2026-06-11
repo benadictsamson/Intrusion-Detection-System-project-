@@ -1,0 +1,22 @@
+ADMIN_USER=admin
+ADMIN_PASS=change-me
+
+# Optional secondary admin credentials (for demo/training)
+ADMIN_USER_2=admin1
+ADMIN_PASS_2=hari123
+
+# Traffic stimulator / attack simulator credentials
+STIMULATOR_USER=stimulator
+STIMULATOR_PASS=stimulate2024
+
+# Optional secondary stimulator/simulator credentials (for demo/training)
+STIMULATOR_USER_2=simulator
+STIMULATOR_PASS_2=1234hari
+
+SESSION_SECRET=change-me-too
+PORT=3000
+# For Supabase/Postgres set the full connection string (recommended)
+# Example: postgres://user:password@db.host:5432/dbname
+DATABASE_URL=postgresql://postgres:[r2I0DzDQff7GwuP8]@db.ygkaoptgbljyxqwagijn.supabase.co:5432/postgres
+# If your Postgres requires SSL and you want to accept self-signed certs, set to 'true'
+DB_SSL=false

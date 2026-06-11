@@ -1,0 +1,1056 @@
+const loginPanel = document.getElementById("loginPanel");
+const adminPanel = document.getElementById("adminPanel");
+const loginForm = document.getElementById("loginForm");
+const loginError = document.getElementById("loginError");
+const productForm = document.getElementById("productForm");
+const adminProducts = document.getElementById("adminProducts");
+const adminEmpty = document.getElementById("adminEmpty");
+const productsContainer = document.getElementById("productsContainer");
+const logoutBtn = document.getElementById("logoutBtn");
+const totalProductsEl = document.getElementById("totalProducts");
+const totalCategoriesEl = document.getElementById("totalCategories");
+const avgPriceEl = document.getElementById("avgPrice");
+
+// Loading state to prevent multiple simultaneous requests
+let isLoadingProducts = false;
+
+// Real-time state
+let ws = null;
+let wsShouldReconnect = false;
+let lastIncidentIdForPopup = null;
+let incidentsCache = [];
+let lastIncidentsRefreshAtMs = 0;
+
+let lastRealtimeUserCount = null;
+let lastRealtimeSimRunning = false;
+let lastRealtimeMetricsAtMs = 0;
+
+function wsDebugEnabled() {
+  try {
+    return String(localStorage.getItem('debugWs') || '') === '1';
+  } catch {
+    return false;
+  }
+}
+
+let lastWsDebugLogAtMs = 0;
+function wsDebugLog(...args) {
+  if (!wsDebugEnabled()) return;
+  const now = Date.now();
+  if (now - lastWsDebugLogAtMs < 1000) return; // throttle
+  lastWsDebugLogAtMs = now;
+  console.log('[admin/ws]', ...args);
+}
+
+const liveSeries = {
+  rps: []
+};
+
+const clampSeries = (arr, max) => {
+  while (arr.length > max) arr.shift();
+};
+
+const formatNumber = (n, digits = 1) => {
+  const x = Number(n);
+  if (Number.isNaN(x)) return '0';
+  return x.toFixed(digits);
+};
+
+const formatPct = (n) => {
+  const x = Number(n);
+  if (Number.isNaN(x)) return '0%';
+  return `${Math.round(x)}%`;
+};
+
+function severityBadgeClass(sev) {
+  const s = String(sev || 'low').toLowerCase();
+  if (s === 'high') return 'high';
+  if (s === 'medium') return 'medium';
+  return 'low';
+}
+
+function setIdsStatus(status) {
+  if (!idsDot || !idsStatusEl || !idsSeverityEl) return;
+  const underAttack = Boolean(status && status.underAttack);
+
+  if (!underAttack) {
+    idsDot.classList.remove('danger', 'warning');
+    idsStatusEl.textContent = 'IDS: Normal';
+    idsSeverityEl.textContent = 'low';
+    idsSeverityEl.className = 'badge low';
+    return;
+  }
+
+  const threat = status.threat || {};
+  const sev = String(threat.severity || 'medium').toLowerCase();
+  idsStatusEl.textContent = `IDS: Potential Attack (${threat.attackType || 'Unknown'})`;
+  idsSeverityEl.textContent = sev;
+  idsSeverityEl.className = `badge ${severityBadgeClass(sev)}`;
+
+  idsDot.classList.remove('danger', 'warning');
+  if (sev === 'high') idsDot.classList.add('danger');
+  else idsDot.classList.add('warning');
+}
+
+function drawLiveChart() {
+  if (!liveChart) return;
+  const ctx = liveChart.getContext('2d');
+  if (!ctx) return;
+
+  const w = liveChart.width;
+  const h = liveChart.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // grid
+  ctx.strokeStyle = '#e2e8f0';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = 10 + ((h - 20) / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(10, y);
+    ctx.lineTo(w - 10, y);
+    ctx.stroke();
+  }
+
+  const values = liveSeries.rps;
+  if (!values.length) return;
+  const max = Math.max(10, ...values);
+  const xStep = (w - 20) / Math.max(1, values.length - 1);
+  const yScale = (h - 20) / (max || 1);
+
+  ctx.strokeStyle = '#3182ce';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  values.forEach((v, i) => {
+    const x = 10 + i * xStep;
+    const y = h - 10 - (v * yScale);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  ctx.fillStyle = '#718096';
+  ctx.font = '12px Inter';
+  ctx.textAlign = 'left';
+  ctx.fillText(`RPS (max ${Math.round(max)})`, 10, 14);
+}
+
+function renderIncidentItem(incident, { showAck } = {}) {
+  const item = document.createElement('div');
+  item.className = 'incident-item';
+
+  const meta = document.createElement('div');
+  meta.className = 'incident-meta';
+
+  const title = document.createElement('div');
+  title.className = 'incident-title';
+  title.textContent = `#${incident.id} • ${incident.attackType}`;
+
+  const endpoints = (incident.affectedEndpoints || []).join(' | ');
+  const sub = document.createElement('div');
+  sub.className = 'incident-sub';
+  sub.textContent = `${incident.timestamp} • Affected: ${endpoints || '—'}`;
+
+  meta.append(title, sub);
+
+  const right = document.createElement('div');
+  right.style.display = 'flex';
+  right.style.alignItems = 'center';
+  right.style.gap = '10px';
+
+  const badge = document.createElement('span');
+  badge.className = `badge ${severityBadgeClass(incident.severity)}`;
+  badge.textContent = incident.severity;
+  right.appendChild(badge);
+
+  if (showAck) {
+    const ackBtn = document.createElement('button');
+    ackBtn.className = 'btn btn-outline';
+    ackBtn.textContent = 'Ack';
+    ackBtn.addEventListener('click', () => ackIncident(incident.id));
+    right.appendChild(ackBtn);
+  }
+
+  item.append(meta, right);
+  return item;
+}
+
+function renderIncidents(incidents) {
+  incidentsCache = Array.isArray(incidents) ? incidents : [];
+  if (alertsListEl) alertsListEl.innerHTML = '';
+  if (incidentLogEl) incidentLogEl.innerHTML = '';
+
+  const open = incidentsCache.filter(i => i.status === 'open');
+  const recent = incidentsCache.slice(0, 20);
+
+  if (alertsListEl) {
+    if (!open.length) {
+      const empty = document.createElement('div');
+      empty.style.color = 'var(--admin-text-light)';
+      empty.textContent = 'No active alerts.';
+      alertsListEl.appendChild(empty);
+    } else {
+      open.slice(0, 10).forEach(i => alertsListEl.appendChild(renderIncidentItem(i, { showAck: true })));
+    }
+  }
+
+  if (incidentLogEl) {
+    if (!recent.length) {
+      const empty = document.createElement('div');
+      empty.style.color = 'var(--admin-text-light)';
+      empty.textContent = 'No incidents yet.';
+      incidentLogEl.appendChild(empty);
+    } else {
+      recent.forEach(i => incidentLogEl.appendChild(renderIncidentItem(i, { showAck: false })));
+    }
+  }
+}
+
+function showAlertPopup(incident) {
+  if (!alertPopupEl || !alertTitleEl || !alertDetailsEl) return;
+  lastIncidentIdForPopup = incident?.id || null;
+  const endpoints = (incident?.affectedEndpoints || []).join(' | ');
+  alertTitleEl.textContent = `Potential Attack Detected: ${incident.attackType} (${incident.severity})`;
+  const pauseNote = incident?.sitePaused
+    ? ` • Website paused temporarily${incident?.sitePausedUntil ? ` (until ${incident.sitePausedUntil})` : ''}`
+    : '';
+  alertDetailsEl.textContent = `${incident.timestamp} • Affected: ${endpoints || '—'}${pauseNote}`;
+  alertPopupEl.classList.remove('hidden');
+}
+
+function hideAlertPopup() {
+  if (!alertPopupEl) return;
+  alertPopupEl.classList.add('hidden');
+}
+
+async function ackIncident(id) {
+  try {
+    const res = await fetch(`/api/admin/ids/incidents/${id}/ack`, { method: 'POST' });
+    const data = await res.json();
+    if (!data.ok) return;
+    await refreshIncidents();
+    hideAlertPopup();
+  } catch {
+    // ignore
+  }
+}
+
+async function refreshIncidents() {
+  try {
+    const res = await fetch('/api/admin/ids/incidents?limit=50');
+    const data = await res.json();
+    if (data && data.ok) renderIncidents(data.incidents);
+  } catch {
+    // ignore
+  }
+}
+
+function connectRealtime() {
+  if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+  wsShouldReconnect = true;
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  console.log('[admin/ws] connecting to', `${proto}://${window.location.host}/ws`);
+  ws = new WebSocket(`${proto}://${window.location.host}/ws`);
+
+  ws.addEventListener('open', () => {
+    console.log('[admin/ws] connection open');
+    wsDebugLog('open');
+    try {
+      ws.send(JSON.stringify({ type: 'hello', module: 'admin' }));
+    } catch {
+      // ignore
+    }
+  });
+
+  ws.addEventListener('error', (err) => {
+    console.error('[admin/ws] error', err);
+    wsDebugLog('error', err && err.message ? err.message : err);
+  });
+
+  ws.addEventListener('message', (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+
+    if (!msg || !msg.type) return;
+
+    if (msg.type === 'metrics' && msg.data) {
+      const m = msg.data;
+      console.log('[admin/ws] metrics received', {
+        isRunning: m.isRunning,
+        attackType: m.attackType,
+        intensity: m.intensity,
+        userCount: m.userCount,
+        rps: Number(m.requestRate || 0).toFixed(1)
+      });
+      lastRealtimeMetricsAtMs = Date.now();
+      const runningSim = Boolean(m.simulator && m.simulator.running);
+      const simVirtualUsers = Number(m.simulator?.virtualUsers || 0);
+      const simConcurrency = Number(m.simulator?.concurrency || 0);
+      const shownUsers = runningSim
+        ? (simVirtualUsers > 0 ? simVirtualUsers : (simConcurrency > 0 ? simConcurrency : (m.userCount ?? 0)))
+        : (m.userCount ?? 0);
+
+      lastRealtimeUserCount = shownUsers;
+      lastRealtimeSimRunning = runningSim;
+
+      // Force UI update on every message (avoid stale state).
+      console.log('[admin/ws] updating DOM with:', { shownUsers, rps: formatNumber(m.requestRate, 1) });
+      if (rtUserCountEl) {
+        rtUserCountEl.innerText = String(shownUsers);
+        console.log('[admin/ws] ✓ updated rtUserCount to', shownUsers);
+      } else {
+        console.warn('[admin/ws] ✗ rtUserCountEl not found');
+      }
+      if (activeUsersEl) {
+        activeUsersEl.innerText = String(shownUsers);
+        console.log('[admin/ws] ✓ updated activeUsersEl to', shownUsers);
+      }
+      if (rtRpsEl) {
+        rtRpsEl.textContent = `${formatNumber(m.requestRate, 1)} rps`;
+        console.log('[admin/ws] ✓ updated rtRps to', formatNumber(m.requestRate, 1));
+      } else {
+        console.warn('[admin/ws] ✗ rtRpsEl not found');
+      }
+      if (rtRespEl) rtRespEl.textContent = `${Math.round(m.responseTimeMs?.avg || 0)} ms`;
+      if (rtErrEl) rtErrEl.textContent = formatPct(m.errorRate);
+
+      if (rtLoadEl) rtLoadEl.textContent = formatNumber(m.serverLoad?.load1 || 0, 2);
+      if (rtMemEl) rtMemEl.textContent = `${formatNumber(m.serverLoad?.memRssMb || 0, 1)} MB`;
+      if (rtLagEl) rtLagEl.textContent = `${formatNumber(m.serverLoad?.eventLoopLagMsP95 || 0, 1)} ms`;
+
+      if (rtSimEl) {
+        const simRps = Number(m.simulatedRequestRate || 0);
+        rtSimEl.textContent = runningSim ? `Yes (sim ${formatNumber(simRps, 1)} rps)` : 'No';
+      }
+
+      wsDebugLog({
+        receivedUserCount: m.userCount,
+        shownUsers,
+        runningSim,
+        simVirtualUsers,
+        simConcurrency,
+        selectors: {
+          rtUserCountEl: Boolean(rtUserCountEl),
+          activeUsersEl: Boolean(activeUsersEl),
+          rtSimEl: Boolean(rtSimEl)
+        }
+      });
+
+      setIdsStatus(m.ids);
+
+      // Live RPS chart
+      liveSeries.rps.push(Number(m.requestRate || 0));
+      clampSeries(liveSeries.rps, 60);
+      drawLiveChart();
+
+      // Display attack details
+      const attackDetailsEl = document.getElementById('attackDetails');
+      if (attackDetailsEl && m.attackDetails) {
+        const { selectedAttackType, intensity, running, virtualUsers, virtualUsersTarget } = m.attackDetails;
+        if (running) {
+          const vu = Number(virtualUsers || 0);
+          const target = Number(virtualUsersTarget || 0);
+          const vuText = target > 0 ? `${vu}/${target}` : String(vu);
+          attackDetailsEl.textContent = `Simulated attack: ${selectedAttackType} (Intensity: ${intensity}${vu > 0 ? ` • Virtual users: ${vuText}` : ''})`;
+        } else {
+          attackDetailsEl.textContent = selectedAttackType
+            ? `Selected simulation: ${selectedAttackType}`
+            : 'No active attack';
+        }
+      }
+
+      // Keep incident list up-to-date during simulated attacks/detections (throttled).
+      const underAttack = Boolean(m.ids && m.ids.underAttack);
+      if (underAttack || runningSim) {
+        const now = Date.now();
+        if (now - lastIncidentsRefreshAtMs > 5000) {
+          lastIncidentsRefreshAtMs = now;
+          refreshIncidents();
+        }
+      }
+    }
+
+    if (msg.type === 'incidents' && msg.data) {
+      renderIncidents(msg.data);
+    }
+
+    if (msg.type === 'incident' && msg.data) {
+      const incident = msg.data;
+      if (incident && incident.id != null) {
+        const existingIdx = incidentsCache.findIndex(i => String(i.id) === String(incident.id));
+        if (existingIdx >= 0) incidentsCache[existingIdx] = incident;
+        else incidentsCache = [incident, ...incidentsCache];
+        renderIncidents(incidentsCache);
+
+        // Popup for newly pushed incidents
+        showAlertPopup(incident);
+      } else {
+        // Fallback: pull the latest list
+        refreshIncidents();
+      }
+    }
+
+    // Show alert for high-intensity attacks
+    if (msg.type === 'alert' && msg.data) {
+      // Backward/forward compatible: can be either a message or an incident payload.
+      if (msg.data && typeof msg.data.message === 'string') {
+        alert(msg.data.message);
+      } else if (msg.data && msg.data.attackType) {
+        showAlertPopup(msg.data);
+      }
+    }
+
+    if (wsDebugEnabled()) {
+      // Useful to confirm WS isn't blocked / payload isn't stale.
+      wsDebugLog('message', msg.type);
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    wsDebugLog('close');
+    ws = null;
+    if (wsShouldReconnect) {
+      setTimeout(() => connectRealtime(), 1500);
+    }
+  });
+}
+
+function disconnectRealtime() {
+  wsShouldReconnect = false;
+  try {
+    if (ws) ws.close();
+  } catch {
+    // ignore
+  }
+  ws = null;
+}
+
+// Dashboard elements
+const todayVisitorsEl = document.getElementById("todayVisitors");
+const todayPageViewsEl = document.getElementById("todayPageViews");
+const activeUsersEl = document.getElementById("activeUsers");
+const conversionRateEl = document.getElementById("conversionRate");
+const activityLogsEl = document.getElementById("activityLogs");
+const topProductsListEl = document.getElementById("topProductsList");
+const trafficChart = document.getElementById("trafficChart");
+
+// Real-time monitoring elements
+const idsDot = document.getElementById('idsDot');
+const idsStatusEl = document.getElementById('idsStatus');
+const idsSeverityEl = document.getElementById('idsSeverity');
+
+const rtUserCountEl = document.getElementById('rtUserCount');
+const rtRpsEl = document.getElementById('rtRps');
+const rtRespEl = document.getElementById('rtResp');
+const rtErrEl = document.getElementById('rtErr');
+const rtLoadEl = document.getElementById('rtLoad');
+const rtMemEl = document.getElementById('rtMem');
+const rtLagEl = document.getElementById('rtLag');
+const rtSimEl = document.getElementById('rtSim');
+
+const liveChart = document.getElementById('liveChart');
+const alertsListEl = document.getElementById('alertsList');
+const incidentLogEl = document.getElementById('incidentLog');
+
+const alertPopupEl = document.getElementById('alertPopup');
+const alertTitleEl = document.getElementById('alertTitle');
+const alertDetailsEl = document.getElementById('alertDetails');
+const alertAckBtn = document.getElementById('alertAckBtn');
+const alertDismissBtn = document.getElementById('alertDismissBtn');
+
+// Tab elements
+const tabBtns = document.querySelectorAll(".tab-btn");
+const tabContents = document.querySelectorAll(".tab-content");
+
+const toggleAdmin = (isAdmin) => {
+  if (isAdmin) {
+    loginPanel.classList.add("hidden");
+    adminPanel.classList.remove("hidden");
+    loadDashboardData();
+    connectRealtime();
+    refreshIncidents();
+  } else {
+    adminPanel.classList.add("hidden");
+    loginPanel.classList.remove("hidden");
+    disconnectRealtime();
+  }
+};
+
+if (alertAckBtn) {
+  alertAckBtn.addEventListener('click', () => {
+    if (!lastIncidentIdForPopup) return;
+    ackIncident(lastIncidentIdForPopup);
+  });
+}
+
+if (alertDismissBtn) {
+  alertDismissBtn.addEventListener('click', () => hideAlertPopup());
+}
+
+const formatPrice = (price) => {
+  return `₹${Number(price).toFixed(2)}`;
+};
+
+const renderStars = (rating) => {
+  const n = Number(rating);
+  if (Number.isNaN(n)) return '0.0/5';
+  return `${Math.max(0, Math.min(5, n)).toFixed(1)}/5`;
+};
+
+// Tab switching functionality
+tabBtns.forEach(btn => {
+  btn.addEventListener("click", () => {
+    const targetTab = btn.dataset.tab;
+
+    // Remove active class from all tabs
+    tabBtns.forEach(b => b.classList.remove("active"));
+    tabContents.forEach(c => c.classList.remove("active"));
+
+    // Add active class to clicked tab
+    btn.classList.add("active");
+    document.getElementById(targetTab + "Tab").classList.add("active");
+
+    // Load data for the active tab (only if not already loaded)
+    if (targetTab === "dashboard") {
+      loadDashboardData();
+    } else if (targetTab === "products") {
+      // Only load products if not already loaded or if container is empty
+      if (adminProducts.children.length === 0) {
+        loadProducts();
+      }
+    }
+  });
+});
+
+// Dashboard data loading functions
+const loadDashboardData = () => {
+  loadTrafficStats();
+  loadActivityLogs();
+  loadTopProducts();
+  drawTrafficChart();
+};
+
+const loadTrafficStats = () => {
+  fetch("/api/admin/analytics/traffic")
+    .then((res) => res.json())
+    .then((data) => {
+      if (!data.ok) return;
+
+      const stats = data.traffic;
+      todayVisitorsEl.textContent = stats.todayVisitors;
+      todayPageViewsEl.textContent = stats.todayPageViews;
+      // WS should be the source of truth for active users during live monitoring.
+      // Avoid overwriting a fresh WS-driven value with a slower API response.
+      const hasFreshRealtime = lastRealtimeMetricsAtMs && (Date.now() - lastRealtimeMetricsAtMs < 5000);
+      if (!hasFreshRealtime && activeUsersEl) {
+        activeUsersEl.textContent = stats.activeUsers;
+      }
+      conversionRateEl.textContent = stats.conversionRate + "%";
+
+      if (lastRealtimeSimRunning && activeUsersEl && lastRealtimeUserCount !== null) {
+        activeUsersEl.textContent = String(lastRealtimeUserCount);
+      }
+    })
+    .catch(() => {
+      // Fallback to mock data if API fails
+      todayVisitorsEl.textContent = Math.floor(Math.random() * 500) + 200;
+      todayPageViewsEl.textContent = Math.floor(Math.random() * 1500) + 800;
+      const hasFreshRealtime = lastRealtimeMetricsAtMs && (Date.now() - lastRealtimeMetricsAtMs < 5000);
+      if (!hasFreshRealtime && activeUsersEl) {
+        activeUsersEl.textContent = Math.floor(Math.random() * 50) + 20;
+      }
+      conversionRateEl.textContent = (Math.random() * 5 + 1).toFixed(1) + "%";
+
+      if (lastRealtimeSimRunning && activeUsersEl && lastRealtimeUserCount !== null) {
+        activeUsersEl.textContent = String(lastRealtimeUserCount);
+      }
+    });
+};
+
+const loadActivityLogs = () => {
+  fetch("/api/admin/analytics/activity")
+    .then((res) => res.json())
+    .then((data) => {
+      if (!data.ok) return;
+
+      activityLogsEl.innerHTML = "";
+      data.activities.forEach(log => {
+        const logItem = document.createElement("div");
+        logItem.className = `log-item ${log.type}`;
+        logItem.innerHTML = `
+          <span class="log-time">${log.time}</span>
+          <span class="log-message">${log.message}</span>
+        `;
+        activityLogsEl.appendChild(logItem);
+      });
+    })
+    .catch(() => {
+      // Fallback to mock data if API fails
+      const mockLogs = [
+        { time: "14:32", type: "success", message: "User 'john_doe' logged in successfully" },
+        { time: "14:28", type: "info", message: "Product 'Wireless Headphones' added to cart" },
+        { time: "14:25", type: "warning", message: "Failed login attempt for user 'admin'" },
+        { time: "14:20", type: "success", message: "New product 'Smart Watch' added to catalog" },
+        { time: "14:15", type: "info", message: "Product page viewed: 'Laptop Stand'" },
+        { time: "14:10", type: "success", message: "Order #1234 completed successfully" },
+        { time: "14:05", type: "error", message: "Payment failed for order #1233" },
+        { time: "14:00", type: "info", message: "Search performed: 'wireless mouse'" }
+      ];
+
+      activityLogsEl.innerHTML = "";
+      mockLogs.forEach(log => {
+        const logItem = document.createElement("div");
+        logItem.className = `log-item ${log.type}`;
+        logItem.innerHTML = `
+          <span class="log-time">${log.time}</span>
+          <span class="log-message">${log.message}</span>
+        `;
+        activityLogsEl.appendChild(logItem);
+      });
+    });
+};
+
+const loadTopProducts = () => {
+  fetch("/api/products")
+    .then((res) => res.json())
+    .then((data) => {
+      if (!data.ok) return;
+
+      const products = data.products || [];
+      // Sort by rating and review count for "top products"
+      const topProducts = products
+        .sort((a, b) => (b.rating * b.review_count) - (a.rating * a.review_count))
+        .slice(0, 5);
+
+      topProductsListEl.innerHTML = "";
+      topProducts.forEach((product, index) => {
+        const productItem = document.createElement("div");
+        productItem.className = "top-product-item";
+        productItem.innerHTML = `
+          <div class="top-product-rank">${index + 1}</div>
+          <img src="${product.image_url || '/placeholder.jpg'}" alt="${product.name}" class="top-product-image" onerror="this.src='/placeholder.jpg'" />
+          <div class="top-product-info">
+            <div class="top-product-name">${product.name}</div>
+            <div class="top-product-stats">
+              ${formatPrice(product.price)} • ${renderStars(product.rating)} (${product.review_count})
+            </div>
+          </div>
+        `;
+        topProductsListEl.appendChild(productItem);
+      });
+    });
+};
+
+const drawTrafficChart = () => {
+  fetch("/api/admin/analytics/chart")
+    .then((res) => res.json())
+    .then((data) => {
+      if (!data.ok) {
+        // Fallback to mock data
+        drawMockChart();
+        return;
+      }
+
+      const { days, visitors, pageViews } = data.chart;
+      drawChartWithData(days, visitors, pageViews);
+    })
+    .catch(() => {
+      // Fallback to mock data if API fails
+      drawMockChart();
+    });
+};
+
+const drawMockChart = () => {
+  const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const visitors = [120, 150, 180, 200, 250, 220, 190];
+  const pageViews = [450, 520, 680, 750, 890, 780, 650];
+  drawChartWithData(days, visitors, pageViews);
+};
+
+const drawChartWithData = (days, visitors, pageViews) => {
+  if (!trafficChart) return;
+  const ctx = trafficChart.getContext("2d");
+  if (!ctx) return;
+
+  // Clear canvas
+  ctx.clearRect(0, 0, trafficChart.width, trafficChart.height);
+
+  // Chart dimensions
+  const chartWidth = trafficChart.width - 60;
+  const chartHeight = trafficChart.height - 60;
+  const barWidth = chartWidth / days.length / 2;
+
+  // Find max values for scaling
+  const maxVisitors = Math.max(...visitors);
+  const maxPageViews = Math.max(...pageViews);
+  const maxValue = Math.max(maxVisitors, maxPageViews);
+
+  // Draw grid lines
+  ctx.strokeStyle = '#e2e8f0';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 5; i++) {
+    const y = 30 + (chartHeight / 5) * i;
+    ctx.beginPath();
+    ctx.moveTo(40, y);
+    ctx.lineTo(trafficChart.width - 20, y);
+    ctx.stroke();
+
+    // Y-axis labels
+    ctx.fillStyle = '#718096';
+    ctx.font = '10px Inter';
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.round(maxValue * (5 - i) / 5), 35, y + 3);
+  }
+
+  // Draw bars
+  visitors.forEach((value, index) => {
+    const x = 50 + index * (chartWidth / days.length);
+    const height = (value / maxValue) * chartHeight;
+
+    // Visitors bar (blue)
+    ctx.fillStyle = '#3182ce';
+    ctx.fillRect(x, trafficChart.height - 30 - height, barWidth, height);
+
+    // Page views bar (green)
+    const pageViewHeight = (pageViews[index] / maxValue) * chartHeight;
+    ctx.fillStyle = '#38a169';
+    ctx.fillRect(x + barWidth, trafficChart.height - 30 - pageViewHeight, barWidth, pageViewHeight);
+  });
+
+  // Draw legend
+  ctx.fillStyle = '#3182ce';
+  ctx.fillRect(trafficChart.width - 120, 10, 12, 12);
+  ctx.fillStyle = '#38a169';
+  ctx.fillRect(trafficChart.width - 120, 25, 12, 12);
+
+  ctx.fillStyle = '#2d3748';
+  ctx.font = '12px Inter';
+  ctx.textAlign = 'left';
+  ctx.fillText('Visitors', trafficChart.width - 100, 18);
+  ctx.fillText('Page Views', trafficChart.width - 100, 33);
+
+  // Draw X-axis labels
+  ctx.fillStyle = '#718096';
+  ctx.font = '10px Inter';
+  ctx.textAlign = 'center';
+  days.forEach((day, index) => {
+    const x = 50 + index * (chartWidth / days.length) + barWidth;
+    ctx.fillText(day, x, trafficChart.height - 10);
+  });
+};
+
+const updateStats = (products) => {
+  const totalProducts = products.length;
+  const categories = new Set(products.map(p => p.category).filter(c => c));
+  const totalCategories = categories.size;
+  const avgPrice = totalProducts > 0
+    ? products.reduce((sum, p) => sum + Number(p.price), 0) / totalProducts
+    : 0;
+
+  totalProductsEl.textContent = totalProducts;
+  totalCategoriesEl.textContent = totalCategories;
+  avgPriceEl.textContent = formatPrice(avgPrice);
+};
+
+const createEditForm = (product) => {
+  const editForm = document.createElement("tr");
+  editForm.className = "edit-form";
+  editForm.innerHTML = `
+    <td colspan="6">
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; padding: 16px; background: #fefcbf; border: 1px solid #f6e05e; border-radius: 8px; margin-top: 8px;">
+        <div>
+          <label style="display: block; font-weight: 500; margin-bottom: 4px;">Name</label>
+          <input type="text" value="${product.name}" class="edit-name form-input" style="width: 100%;" />
+        </div>
+        <div>
+          <label style="display: block; font-weight: 500; margin-bottom: 4px;">Price (₹)</label>
+          <input type="number" value="${product.price}" class="edit-price form-input" min="0" step="0.01" style="width: 100%;" />
+        </div>
+        <div>
+          <label style="display: block; font-weight: 500; margin-bottom: 4px;">Category</label>
+          <select class="edit-category form-input" style="width: 100%;">
+            <option value="">Select Category</option>
+            <option value="Electronics" ${product.category === 'Electronics' ? 'selected' : ''}>Electronics</option>
+            <option value="Fashion" ${product.category === 'Fashion' ? 'selected' : ''}>Fashion</option>
+            <option value="Home & Kitchen" ${product.category === 'Home & Kitchen' ? 'selected' : ''}>Home & Kitchen</option>
+            <option value="Books" ${product.category === 'Books' ? 'selected' : ''}>Books</option>
+            <option value="Sports & Fitness" ${product.category === 'Sports & Fitness' ? 'selected' : ''}>Sports & Fitness</option>
+            <option value="Beauty & Personal Care" ${product.category === 'Beauty & Personal Care' ? 'selected' : ''}>Beauty & Personal Care</option>
+            <option value="Mobile Accessories" ${product.category === 'Mobile Accessories' ? 'selected' : ''}>Mobile Accessories</option>
+            <option value="Computers" ${product.category === 'Computers' ? 'selected' : ''}>Computers</option>
+            <option value="Wearable Technology" ${product.category === 'Wearable Technology' ? 'selected' : ''}>Wearable Technology</option>
+            <option value="Toys & Games" ${product.category === 'Toys & Games' ? 'selected' : ''}>Toys & Games</option>
+            <option value="Musical Instruments" ${product.category === 'Musical Instruments' ? 'selected' : ''}>Musical Instruments</option>
+            <option value="Bags & Luggage" ${product.category === 'Bags & Luggage' ? 'selected' : ''}>Bags & Luggage</option>
+          </select>
+        </div>
+        <div>
+          <label style="display: block; font-weight: 500; margin-bottom: 4px;">Brand</label>
+          <input type="text" value="${product.brand || ''}" class="edit-brand form-input" style="width: 100%;" />
+        </div>
+        <div>
+          <label style="display: block; font-weight: 500; margin-bottom: 4px;">Rating</label>
+          <input type="number" value="${product.rating || 0}" class="edit-rating form-input" min="0" max="5" step="0.1" style="width: 100%;" />
+        </div>
+        <div style="display: flex; align-items: end; gap: 8px;">
+          <button class="btn btn-primary save-edit" style="flex: 1;">Save</button>
+          <button class="btn btn-outline cancel-edit" style="flex: 1;">Cancel</button>
+        </div>
+      </div>
+    </td>
+  `;
+
+  // Add event listeners
+  const saveBtn = editForm.querySelector(".save-edit");
+  const cancelBtn = editForm.querySelector(".cancel-edit");
+
+  saveBtn.addEventListener("click", () => {
+    const updatedProduct = {
+      name: editForm.querySelector(".edit-name").value,
+      price: editForm.querySelector(".edit-price").value,
+      category: editForm.querySelector(".edit-category").value,
+      brand: editForm.querySelector(".edit-brand").value,
+      rating: editForm.querySelector(".edit-rating").value,
+      description: product.description,
+      imageUrl: product.image_url,
+      reviewCount: product.review_count
+    };
+
+    fetch(`/api/admin/products/${product.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updatedProduct)
+    })
+    .then((res) => res.json())
+    .then((data) => {
+      if (data.ok) {
+        loadProducts();
+      } else {
+        alert("Failed to update product: " + data.message);
+      }
+    });
+  });
+
+  cancelBtn.addEventListener("click", () => {
+    loadProducts();
+  });
+
+  return editForm;
+};
+
+const loadProducts = () => {
+  // Prevent multiple simultaneous loads
+  if (isLoadingProducts) return;
+  isLoadingProducts = true;
+
+  fetch("/api/products")
+    .then((res) => res.json())
+    .then((data) => {
+      if (!data.ok) {
+        isLoadingProducts = false;
+        return;
+      }
+
+      adminProducts.innerHTML = "";
+      const products = data.products || [];
+
+      updateStats(products);
+
+      if (!products.length) {
+        adminEmpty.classList.remove("hidden");
+        productsContainer.classList.add("hidden");
+        isLoadingProducts = false;
+        return;
+      }
+
+      adminEmpty.classList.add("hidden");
+      productsContainer.classList.remove("hidden");
+
+      products.forEach((product) => {
+        const row = document.createElement("tr");
+
+        row.innerHTML = `
+          <td>
+            <img src="${product.image_url || '/placeholder.jpg'}" alt="${product.name}" class="product-image" onerror="this.src='/placeholder.jpg'" />
+          </td>
+          <td>
+            <div class="product-name">${product.name}</div>
+            <div style="color: var(--admin-text-light); font-size: 12px; margin-top: 4px;">
+              ${product.brand ? `Brand: ${product.brand}` : ''}
+            </div>
+          </td>
+          <td>
+            <span class="product-category">${product.category || 'Uncategorized'}</span>
+          </td>
+          <td>
+            <span class="product-price">${formatPrice(product.price)}</span>
+          </td>
+          <td>
+            <div style="display: flex; align-items: center; gap: 4px;">
+              <span style="color: #d69e2e;">${renderStars(product.rating || 0)}</span>
+              <span style="font-size: 12px; color: var(--admin-text-light);">(${product.review_count || 0})</span>
+            </div>
+          </td>
+          <td>
+            <div class="action-buttons">
+              <button class="btn-icon btn-edit edit-btn" title="Edit Product">Edit</button>
+              <button class="btn-icon btn-delete delete-btn" title="Delete Product">Delete</button>
+            </div>
+          </td>
+        `;
+
+        // Add event listeners for edit and delete
+        const editBtn = row.querySelector(".edit-btn");
+        const deleteBtn = row.querySelector(".delete-btn");
+
+        editBtn.addEventListener("click", () => {
+          // Close any existing edit forms first
+          const existingEditForms = document.querySelectorAll(".edit-form");
+          existingEditForms.forEach(form => form.remove());
+
+          const existingEditForm = row.nextElementSibling;
+          if (existingEditForm && existingEditForm.classList.contains("edit-form")) {
+            existingEditForm.remove();
+          } else {
+            const editForm = createEditForm(product);
+            row.parentNode.insertBefore(editForm, row.nextSibling);
+          }
+        });
+
+        deleteBtn.addEventListener("click", () => {
+          if (confirm(`Are you sure you want to delete "${product.name}"?`)) {
+            fetch(`/api/admin/products/${product.id}`, { method: "DELETE" })
+              .then((res) => res.json())
+              .then(() => loadProducts());
+          }
+        });
+
+        adminProducts.appendChild(row);
+      });
+
+      isLoadingProducts = false;
+    })
+    .catch(() => {
+      isLoadingProducts = false;
+    });
+};
+
+// Check admin status on page load
+fetch("/api/admin/me")
+  .then((res) => res.json())
+  .then((data) => {
+    toggleAdmin(Boolean(data.isAdmin));
+    if (data.isAdmin) {
+      loadDashboardData();
+      // Also load products if products tab is active
+      const activeTab = document.querySelector(".tab-btn.active");
+      if (activeTab && activeTab.dataset.tab === "products") {
+        loadProducts();
+      }
+    }
+  });
+
+// Login form handler
+loginForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  loginError.classList.add("hidden");
+
+  const formData = new FormData(loginForm);
+  const payload = {
+    username: formData.get("username"),
+    password: formData.get("password")
+  };
+
+  fetch("/api/admin/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  })
+    .then((res) => res.json())
+    .then((data) => {
+      if (!data.ok) {
+        loginError.textContent = "Invalid username or password.";
+        loginError.classList.remove("hidden");
+        return;
+      }
+
+      loginForm.reset();
+      toggleAdmin(true);
+      loadDashboardData();
+    })
+    .catch(() => {
+      loginError.textContent = "Login failed. Try again.";
+      loginError.classList.remove("hidden");
+    });
+});
+
+// Product form handler
+productForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const formData = new FormData(productForm);
+  const payload = {
+    name: formData.get("name"),
+    price: formData.get("price"),
+    imageUrl: formData.get("imageUrl"),
+    description: formData.get("description"),
+    category: formData.get("category"),
+    brand: formData.get("brand"),
+    rating: formData.get("rating"),
+    reviewCount: formData.get("reviewCount")
+  };
+
+  fetch("/api/admin/products", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  })
+    .then((res) => res.json())
+    .then((data) => {
+      if (data.ok) {
+        productForm.reset();
+        loadProducts();
+      }
+    });
+});
+
+// Logout handler
+logoutBtn.addEventListener("click", () => {
+  fetch("/api/admin/logout", { method: "POST" }).then(() => {
+    toggleAdmin(false);
+  });
+});
+
+// Function to handle attack selection from the simulator panel
+function selectAttack(attackType) {
+  fetch('/api/simulator/select', { // Updated API endpoint
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ attackType }),
+  })
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error('Failed to select attack');
+      }
+      return response.json();
+    })
+    .then((data) => {
+      console.log('Attack selected:', data);
+    })
+    .catch((error) => {
+      console.error('Error selecting attack:', error);
+    });
+}
+
+// Example: Add event listener to simulator panel buttons
+document.querySelectorAll('.attack-select-button').forEach((button) => {
+  button.addEventListener('click', () => {
+    const attackType = button.dataset.attackType;
+    selectAttack(attackType);
+  });
+});
